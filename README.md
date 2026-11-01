@@ -3,7 +3,7 @@
 A compact, mobile-first **Settings → MCP** plugin for **DSH Mobile on Android**.
 Independent community project, not an official DeepSeek or DSH Mobile component.
 
-**Community source preview:** `0.7.0-preview.1`, derived from the Android-validated personal prototype `0.6.2`. This is **not yet a published npm release**. Against an isolated genuine DSH `0.2.1-rc.5` SDK assembled with Mobile's versioned Android adaptations, the final suite passed **449/451 tests with zero failures and two intentional standalone-loader skips**; separate genuine production-resolution checks passed **2/2 without that loader**. This is fixture/import evidence, not a community-edition APK installation, live GUI test or broader platform certification. The existing rc.2 personal installation was left unchanged.
+**Community preview:** `0.7.0-preview.1`, derived from the Android-validated personal prototype `0.6.2`. Registry availability and the `preview` dist-tag must be independently verified; public source alone does not prove publication. Against an isolated genuine DSH `0.2.1-rc.5` SDK assembled with Mobile's versioned Android adaptations, the final suite passed **449/451 tests with zero failures and two intentional standalone-loader skips**; separate genuine production-resolution checks passed **2/2 without that loader**. This is fixture/import evidence, not a community-edition APK installation, live GUI test or broader platform certification. The existing rc.2 personal installation was left unchanged.
 
 ## Why this exists
 
@@ -25,7 +25,7 @@ It originated after a user could not get a maintainer-recommended MCP settings p
 
 ## Installation
 
-The registry installation below becomes available only after the first npm release is published:
+Independently verify registry availability before using this manual official-CLI preview installation on the exact supported SDK. Select `@preview` explicitly, not the default `latest`; this is not a claim that Mobile's market can install the preview:
 
 ```sh
 dsh plugin --profile web add @masspedro/dsh-mcp-console@preview
