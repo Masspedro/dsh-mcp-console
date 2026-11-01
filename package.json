@@ -1,0 +1,30 @@
+{
+  "name": "@masspedro/dsh-mcp-console",
+  "version": "0.7.0-preview.1",
+  "description": "Mobile-first DSH settings for verified MCP connections, encrypted credentials and explicit tool selection",
+  "license": "MIT",
+  "author": "Masspedro",
+  "repository": { "type": "git", "url": "git+https://github.com/Masspedro/dsh-mcp-console.git" },
+  "homepage": "https://github.com/Masspedro/dsh-mcp-console#readme",
+  "bugs": { "url": "https://github.com/Masspedro/dsh-mcp-console/issues" },
+  "keywords": ["deepseek-harness", "dsh-plugin", "dsh-mobile", "android", "mcp", "settings", "mcp-client"],
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": { ".": "./lib/index.js", "./client": "./lib/client.js", "./cordis.patch.yml": "./cordis.patch.yml", "./package.json": "./package.json" },
+  "files": ["lib/*.js", "docs/*.md", "README.md", "LICENSE", "NOTICE", "cordis.patch.yml"],
+  "engines": { "node": ">=24 <25", "dsh": "0.2.1-rc.5" },
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" }, "client": { "platform": "web", "external": ["react", "zod", "@deepseek-ai/dsh-client-ui-primitives"], "inject": ["@deepseek-ai/dsh-api-gateway", "@deepseek-ai/dsh-client-connection", "@deepseek-ai/dsh-client-locale", "@deepseek-ai/dsh-client-ui-settings", "@deepseek-ai/dsh-client-ui-settings-general", "@deepseek-ai/dsh-client-ui-renderer"] } },
+  "peerDependencies": { "@deepseek-ai/cordis": "~4.0.5", "@deepseek-ai/dsh-mcp-client": "0.2.1-rc.5", "@deepseek-ai/dsh-tools": "0.2.1-rc.5", "@deepseek-ai/dsh-typert-protocol": "0.2.1-rc.5", "zod": "^4.4.3" },
+  "devDependencies": { "@deepseek-ai/dsh": "0.2.1-rc.5", "zod": "4.4.3" },
+  "publishConfig": { "access": "public", "tag": "preview", "registry": "https://registry.npmjs.org/" },
+  "scripts": {
+    "build": "node scripts/build.js",
+    "test": "node scripts/build.js && node --expose-internals --import ./test/register.js --test test/*.test.js",
+    "test:sdk": "node --expose-internals --import ./test/register.js --test test/sdk.test.js",
+    "test:resolution": "node --expose-internals --test test/runtime-resolution.test.js",
+    "check": "node scripts/build.js --check",
+    "check:isolated": "node scripts/check-isolated-sdk.mjs",
+    "audit:package": "node scripts/audit-package.mjs",
+    "prepack": "node scripts/build.js"
+  }
+}

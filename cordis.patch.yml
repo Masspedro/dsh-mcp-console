@@ -1,0 +1,6 @@
+# Supported DSH bundle registration overlay. This does not change engine source.
+# Opening the screen never connects. Plugin startup may restore only saved servers
+# that the user explicitly enabled; missing/legacy/OFF records stay inactive.
+- insert:
+    - id: personal-mcp-console
+      name: '@masspedro/dsh-mcp-console'

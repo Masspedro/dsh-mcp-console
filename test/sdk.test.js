@@ -1,0 +1,205 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, readdir } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { Context } from '@deepseek-ai/cordis';
+import * as clientGateway from '@deepseek-ai/dsh-api-gateway/client';
+import { z } from 'zod';
+import { TypertRegistry } from '@deepseek-ai/dsh-typert-registry';
+import { TypertGatewayService } from '@deepseek-ai/dsh-api-gateway';
+import { remoteMethods } from '@deepseek-ai/dsh-typert-protocol';
+import { RemoteAccessService } from '@deepseek-ai/dsh-api-remote-access';
+import * as mcpClient from '@deepseek-ai/dsh-mcp-client';
+import { apply, inject, pluginStoreDirectory, officialMount, bridgeStdioConfig, scopedChildContext, registerHost, REMOTE, externalInventory } from '../src/index.js';
+import { ConsoleController } from '../src/controller.js';
+import { SERVICE, METHODS, NAMESPACE, makeClientContribution } from '../src/contract.js';
+const peer = (kind) => ({ principal: { kind }, signal: new AbortController().signal, interactions: 'none' });
+// Lifecycle-only fake fibers do not model tool services. Real scoped filtering is
+// covered separately by tool-policy.test.js using the actual native ToolRuntime.
+const noToolsScope = context => ({ context, getToolNames: () => [], pause() {}, resume() {}, setPolicy() {}, close() {}, isBlocked: () => false });
+const bridged = config => ({ ...config, ...bridgeStdioConfig(config), failOnStartupError: true, reconnect: { enabled: false, initialDelayMs: 1000, maxDelayMs: 1000, maxAttempts: 1 } });
+
+test('real installed Cordis/Typert/Gateway enforce strict owner-only RPC without connections', async () => {
+  const ctx = new Context();
+  new TypertRegistry(ctx);
+  new RemoteAccessService(ctx);
+  const gateway = new TypertGatewayService(ctx, { websocketHeartbeatIntervalMs: 30000, streamInboxBytes: 100000 });
+  let raw = null; let writes = 0; let mounts = 0; let failMount = true; let verifyMount = false; let stops = 0;
+  const controller = new ConsoleController({ store: { read: async () => structuredClone(raw), transaction: async (fn) => fn(), write: async (value) => { raw = structuredClone(value); writes++; } }, mount: async () => { mounts++; if (failMount) throw new Error('SYNTHETIC-PRIVATE-ERROR'); return { ...(verifyMount ? { initialVerified: true, verifiedAt: 123 } : {}), dispose: async () => { stops++; } }; } });
+  const fiber = ctx.plugin({ name: 'synthetic-console-owner', apply: async (child) => { child.effect(() => () => controller.dispose()); registerHost(child, controller); } });
+  await fiber;
+  const endpoint = NAMESPACE + '/snapshot';
+  assert.equal(ctx.typert.local.get(endpoint).result.mode, 'strict'); assert.equal(ctx.typert.remotes.list().length, 0);
+  assert.deepEqual(remoteMethods(ctx.get(SERVICE)).map((m) => m.method), METHODS);
+  const snapshot = await gateway.invokeRpc(endpoint, { args: { request: {} } }, undefined, peer('owner'));
+  assert.equal(snapshot.ok, true, JSON.stringify(snapshot)); assert.equal(snapshot.value.servers.length, 0);
+  assert.deepEqual(snapshot.value.capabilities, { saveAndActivate: true, persistentActivation: true, toolPolicy: true, configurableTimeout: true });
+  // Real official Client Remote contribution over an in-process authenticated
+  // carrier: not a fabricated proxy and never a WebSocket/MCP/network transport.
+  const clientCtx = new Context(); new TypertRegistry(clientCtx);
+  clientCtx.provide('connection', { interactions: 'none', isLoopback: true, generation: { getSnapshot: () => null }, openWebSocket: () => assert.fail('network forbidden'), rpc: { open: () => assert.fail('stream forbidden'), call: (path, name, payload, signal) => { assert.equal(path, '/api'); return gateway.invokeRpc(name, payload, signal, peer('owner')); } } });
+  const clientFiber = clientCtx.plugin(clientGateway); await clientFiber;
+  const unmount = await clientCtx.remote.$mount(makeClientContribution(z));
+  const projected = await clientCtx.remote.personalMcpConsole.snapshot({});
+  assert.equal(projected.ok, true, JSON.stringify(projected)); assert.deepEqual(projected.value, snapshot.value);
+  const denied = await gateway.invokeRpc(endpoint, { args: { request: {} } }, undefined, peer('worker'));
+  assert.equal(denied.ok, false); assert.equal(denied.error.code, 'remote-access/denied');
+  const invalid = await gateway.invokeRpc(endpoint, { args: { request: { 'SYNTHETIC-PRIVATE-KEY': 'SYNTHETIC-PRIVATE-VALUE' } } }, undefined, peer('owner'));
+  assert.equal(invalid.ok, false); assert.equal(invalid.error.code, 'gateway/input-invalid'); assert.ok(!JSON.stringify(invalid).includes('SYNTHETIC-PRIVATE'));
+  const service = ctx.get(SERVICE); await assert.rejects(service.snapshot({}), (e) => e.code === 'remote-access/denied');
+  const saved = await gateway.invokeRpc(NAMESPACE + '/save', { args: { request: { revision: 0, server: { label: 'Synthetic only', transport: 'stdio', command: '/never-executed', args: [], cwd: '', envRefs: {} } } } }, undefined, peer('owner'));
+  assert.equal(saved.ok, true, JSON.stringify(saved)); assert.equal(mounts, 0);
+  const id = saved.value.servers[0].config.id;
+  const failed = await gateway.invokeRpc(NAMESPACE + '/start', { args: { request: { revision: saved.value.revision, id, confirmation: 'START THIS SERVER' } } }, undefined, peer('owner'));
+  assert.equal(failed.ok, false); assert.equal(failed.error.message, 'MCP console: mount-failed'); assert.ok(!JSON.stringify(failed).includes('SYNTHETIC-PRIVATE-ERROR'));
+  assert.equal(writes, 2, 'Explicit failed Start preserves its durable enabled intent');
+  assert.deepEqual(raw.enabledIds, [id]);
+  let state = (await clientCtx.remote.personalMcpConsole.snapshot({})).value;
+  const call = async (method, fields) => {
+    const response = await clientCtx.remote.personalMcpConsole[method]({ revision: state.revision, ...fields });
+    assert.equal(response.ok, true, JSON.stringify(response)); state = response.value; return state;
+  };
+  await call('initializeVault', { passphrase: 'synthetic-full-rpc-passphrase' });
+  await call('unlock', { passphrase: 'synthetic-full-rpc-passphrase', ttlSeconds: 30 });
+  await call('setSecret', { ref: 'syntheticToken', value: 'SYNTHETIC-NOT-A-CREDENTIAL' });
+  await call('deleteSecret', { ref: 'syntheticToken' });
+  failMount = false;
+  await call('start', { id, confirmation: 'START THIS SERVER' }); assert.equal(state.servers[0].state, 'mounted-status-unavailable');
+  const beforeReconnect = state.revision;
+  const badReconnect = await gateway.invokeRpc(NAMESPACE + '/reconnect', { args: { request: { revision: beforeReconnect, id, confirmation: 'START THIS SERVER' } } }, undefined, peer('owner'));
+  assert.equal(badReconnect.ok, false); assert.equal(badReconnect.error.code, 'gateway/input-invalid'); assert.equal(stops, 0);
+  const workerReconnect = await gateway.invokeRpc(NAMESPACE + '/reconnect', { args: { request: { revision: beforeReconnect, id, confirmation: 'RECONNECT THIS SERVER' } } }, undefined, peer('worker'));
+  assert.equal(workerReconnect.ok, false); assert.equal(workerReconnect.error.code, 'remote-access/denied'); assert.equal(stops, 0);
+  await call('reconnect', { id, confirmation: 'RECONNECT THIS SERVER' }); assert.equal(stops, 1);
+  assert.equal(state.servers[0].state, 'mounted-status-unavailable'); assert.equal(Object.hasOwn(state.servers[0], 'lastVerifiedAt'), false);
+  await call('stop', { id }); assert.equal(stops, 2);
+  await call('lock', {}); assert.equal(state.vault.locked, true);
+  await call('deleteServer', { id }); assert.equal(state.servers.length, 0);
+  await call('save', { server: { label: 'Synthetic client save', transport: 'stdio', command: '/never-executed', args: [], cwd: '', envRefs: {} } });
+  await call('deleteServer', { id: state.servers[0].config.id });
+  const activateRequest = { revision: state.revision, server: { label: 'Verified synthetic client Save', transport: 'stdio', command: '/never-executed', args: [], cwd: '', envRefs: {} }, confirmation: 'SAVE AND ACTIVATE THIS SERVER' };
+  const beforeActivate = { mounts, writes, stops };
+  const invalidActivate = await gateway.invokeRpc(NAMESPACE + '/saveAndActivate', { args: { request: { ...activateRequest, confirmation: 'START THIS SERVER' } } }, undefined, peer('owner'));
+  assert.equal(invalidActivate.ok, false); assert.equal(invalidActivate.error.code, 'gateway/input-invalid');
+  const workerActivate = await gateway.invokeRpc(NAMESPACE + '/saveAndActivate', { args: { request: activateRequest } }, undefined, peer('worker'));
+  assert.equal(workerActivate.ok, false); assert.equal(workerActivate.error.code, 'remote-access/denied');
+  assert.deepEqual({ mounts, writes, stops }, beforeActivate);
+  const unknownActivate = await clientCtx.remote.personalMcpConsole.saveAndActivate(activateRequest);
+  assert.equal(unknownActivate.ok, false); assert.equal(unknownActivate.error.message, 'MCP console: mount-failed');
+  assert.equal(writes, beforeActivate.writes); assert.equal(stops, beforeActivate.stops + 1); assert.equal(raw.servers.length, 0);
+  verifyMount = true;
+  await call('saveAndActivate', { server: activateRequest.server, confirmation: activateRequest.confirmation });
+  assert.equal(state.servers[0].state, 'activation-verified'); assert.equal(state.servers[0].lastVerifiedAt, 123);
+  assert.equal(controller.live.size, 1); assert.equal(controller.pendingSaves.size, 0);
+  await call('stop', { id: state.servers[0].config.id });
+  await call('deleteServer', { id: state.servers[0].config.id });
+  await unmount(); assert.equal(clientCtx.typert.remotes.list().length, 0); await clientFiber.dispose(); await clientCtx.fiber.dispose();
+  await fiber.dispose(); assert.equal(ctx.typert.local.get(endpoint), undefined); await ctx.fiber.dispose();
+});
+test('console activation registers service only and leaves vault/files/MCP children untouched', async () => {
+  const ctx = new Context(); new TypertRegistry(ctx);
+  ctx.provide('tools', { register: () => assert.fail('console RPC is not an LLM tool') });
+  // Always allocate a fresh fixture, never consume an ambient real DSH_HOME.
+  const fixtureHome = await mkdtemp(join(tmpdir(), 'dsh-mcp-console-activation-'));
+  ctx.provide('profileContext', { home: fixtureHome, dir: fixtureHome + '/profiles/one' });
+  const fiber = ctx.plugin({ name: 'synthetic-console-activation', inject, apply }); await fiber;
+  const controller = ctx.get(SERVICE).controller;
+  assert.equal(controller.live.size, 0); assert.equal(controller.key, null); assert.equal(ctx.registry.get(mcpClient), undefined);
+  assert.equal(controller.mode, 'automatic'); assert.equal(typeof controller.automaticKey, 'function');
+  assert.equal(controller.store.directory, pluginStoreDirectory({ home: fixtureHome, dir: fixtureHome + '/profiles/one' }));
+  assert.deepEqual(await readdir(fixtureHome), [], 'Activation must not create vault or store files in a fresh fixture home');
+  await fiber.dispose(); await ctx.fiber.dispose();
+});
+test('stable per-profile store selection uses only public metadata, not package paths or profile file reads', () => {
+  const first = pluginStoreDirectory({ home: '/synthetic/home', dir: '/synthetic/home/profiles/one' });
+  assert.match(first, /^\/synthetic\/home\/storages\/personal-mcp-console\/[a-f0-9]{32}$/);
+  assert.equal(first, pluginStoreDirectory({ home: '/synthetic/home/', dir: '/synthetic/home/profiles/./one' }));
+  assert.notEqual(first, pluginStoreDirectory({ home: '/synthetic/home', dir: '/synthetic/home/profiles/two' }));
+  assert.throws(() => pluginStoreDirectory({ home: '', dir: '../../escape' }), (error) => error.code === 'profile-metadata-unavailable');
+  assert.ok(inject.includes('profileContext')); assert.ok(!first.includes('node_modules'));
+});
+test('official adapter uses the exact MCP plugin, awaits readiness, and disposes only its fiber', async () => {
+  let disposed = 0; let received;
+  const fiber = { state: 2, then: (ok) => Promise.resolve().then(ok), dispose: async () => { disposed++; } };
+  const config = { serverName: 'pc_' + 'a'.repeat(24), transport: 'stdio', command: '/synthetic-no-spawn', args: [], env: {}, cwd: '' };
+  const safeLogs = [];
+  const mountCtx = (returned) => ({ logger: Object.fromEntries(['error','warn','info','debug'].map((level) => [level, (value) => safeLogs.push(value)])), extend: ({ logger }) => ({ plugin: (plugin, conf) => { assert.equal(plugin, mcpClient); received = conf; logger.error(new Error('SYNTHETIC-PRIVATE')); return returned; } }) });
+  const handle = await officialMount(mountCtx(fiber), undefined, noToolsScope)(config);
+  assert.deepEqual(received, bridged(config));
+  assert.equal(handle.initialVerified, true); assert.ok(Number.isSafeInteger(handle.verifiedAt) && handle.verifiedAt >= 0);
+  assert.equal(disposed, 0); await handle.dispose(); assert.equal(disposed, 1);
+  const explicit = { ...config, cwd: '/synthetic/absolute-directory' };
+  await officialMount(mountCtx(fiber), undefined, noToolsScope)(explicit); assert.deepEqual(received, bridged(explicit));
+  const omitted = { ...config }; delete omitted.cwd;
+  await officialMount(mountCtx(fiber), undefined, noToolsScope)(omitted); assert.deepEqual(received, bridged(omitted));
+  const failing = { state: 3, then: (_, bad) => Promise.reject(new Error('SYNTHETIC-PRIVATE')).then(undefined, bad), dispose: async () => { disposed++; } };
+  await assert.rejects(officialMount(mountCtx(failing), undefined, noToolsScope)(config), (e) => e.code === 'mount-failed' && !e.message.includes('PRIVATE')); assert.equal(disposed, 2);
+  assert.ok(!JSON.stringify(safeLogs).includes('PRIVATE'));
+});
+test('native adapter verification waits for readiness and enforces fail-on-startup even for permissive caller config', async () => {
+  let release; let captured; let disposed = 0;
+  const fiber = new Promise(resolve => { release = resolve; }); fiber.state = 1; fiber.dispose = async () => { disposed++; };
+  const ctx = { logger: Object.fromEntries(['error','warn','info','debug'].map(level => [level, () => {}])), extend: () => ({ plugin: (plugin, config) => { assert.equal(plugin, mcpClient); captured = config; return fiber; } }) };
+  let returned = false;
+  const pending = officialMount(ctx, undefined, noToolsScope)({ transport: 'stdio', command: 'node', args: [], env: {}, failOnStartupError: false }).then(handle => { returned = true; return handle; });
+  await Promise.resolve(); assert.equal(returned, false); assert.equal(captured.failOnStartupError, true); assert.equal(captured.command, process.execPath); assert.equal(captured.args[1], 'node'); assert.deepEqual(captured.reconnect, { enabled: false, initialDelayMs: 1000, maxDelayMs: 1000, maxAttempts: 1 });
+  fiber.state = 2; release();
+  const handle = await pending; assert.equal(handle.initialVerified, true); assert.ok(Number.isSafeInteger(handle.verifiedAt));
+  await handle.dispose(); assert.equal(disposed, 1);
+});
+test('active-looking non-ready native child cannot publish an initial-verification marker', async () => {
+  let disposed = 0;
+  const fiber = { state: 1, then: ok => Promise.resolve().then(ok), dispose: async () => { disposed++; } };
+  const ctx = { logger: Object.fromEntries(['error','warn','info','debug'].map(level => [level, () => {}])), extend: () => ({ plugin: () => fiber }) };
+  await assert.rejects(officialMount(ctx, undefined, noToolsScope)({ transport: 'stdio', command: 'python', args: [], env: {} }), error => error.code === 'mount-failed');
+  assert.equal(disposed, 1);
+});
+test('public Cordis metadata shadow suppresses own child logs without changing the parent logger', async () => {
+  const ctx = new Context(); const messages = [];
+  ctx.logger.exporter({ export: (message) => messages.push(message.args) });
+  const original = Object.getOwnPropertyDescriptor(ctx, 'logger').value;
+  const child = scopedChildContext(ctx);
+  const fiber = child.plugin({ name: 'synthetic-no-transport', apply: async (inner) => { inner.logger.error(new Error('SYNTHETIC-PRIVATE')); inner.logger('synthetic').warn('SYNTHETIC-PRIVATE'); } });
+  await fiber;
+  assert.equal(Object.getOwnPropertyDescriptor(ctx, 'logger').value, original);
+  ctx.logger.error('synthetic-parent-visible');
+  assert.ok(JSON.stringify(messages).includes('synthetic-parent-visible')); assert.ok(JSON.stringify(messages).includes('upstream diagnostic suppressed')); assert.ok(!JSON.stringify(messages).includes('SYNTHETIC-PRIVATE'));
+  await fiber.dispose(); await ctx.fiber.dispose();
+});
+test('HTTP credentials remain broker-only and broker closes before any SDK teardown', async () => {
+  const events = []; const marker = 'SYNTHETIC-PRIVATE-HEADER';
+  const ctx = { logger: Object.fromEntries(['error','warn','info','debug'].map(key => [key, () => {}])), extend: () => ({ plugin: (_module, config) => {
+    assert.deepEqual(config.headers, {}); assert.equal(config.url, 'http://127.0.0.1:49152/mcp/synthetic-capability');
+    assert.ok(!JSON.stringify(config).includes(marker));
+    const ready = Promise.resolve(); ready.state = 2;
+    ready.dispose = async () => { events.push('sdk'); };
+    return ready;
+  } }) };
+  const mount = officialMount(ctx, async config => {
+    assert.equal(config.headers['X-API-Key'], marker);
+    return { url: 'http://127.0.0.1:49152/mcp/synthetic-capability', close: async () => { events.push('broker'); } };
+  }, noToolsScope);
+  const handle = await mount({ transport: 'streamable-http', url: 'https://example.invalid/mcp', headers: { 'X-API-Key': marker } });
+  await handle.dispose(); assert.deepEqual(events, ['broker','sdk']);
+});
+test('actual Cordis swallowed disposer failure cannot become a confirmed server shutdown', async () => {
+  const ctx = new Context();
+  const child = ctx.plugin({ name: 'synthetic-incomplete-teardown', apply: inner => { inner.effect(() => () => { throw new Error('SYNTHETIC cleanup failure'); }); } });
+  await child;
+  let data = null;
+  const controller = new ConsoleController({ store: { read: async () => structuredClone(data), transaction: async fn => fn(), write: async value => { data = structuredClone(value); } }, mount: async () => ({ dispose: () => child.dispose() }) });
+  const invoke = (method, extra) => controller.invoke(method, { revision: data?.revision ?? 0, ...extra }, { kind: 'owner' });
+  const snapshot = await invoke('save', { server: { label: 'Synthetic', transport: 'stdio', command: '/synthetic/no-execution', args: [], cwd: '', envRefs: {} } });
+  const id = snapshot.servers[0].config.id;
+  await invoke('start', { id, confirmation: 'START THIS SERVER' });
+  const stopped = await invoke('stop', { id });
+  assert.equal(stopped.servers[0].state, 'unmounted-shutdown-unverified');
+  await controller.dispose(); await ctx.fiber.dispose();
+});
+test('external inventory returns names only, excludes owned and never exposes configuration', () => {
+  const runtime = { fibers: [{ uid: 1, state: 2, config: { serverName: 'external', env: { TOKEN: 'SYNTHETIC-PRIVATE' }, headers: { Authorization: 'SYNTHETIC-PRIVATE' } } }, { uid: 2, state: 2, config: { serverName: 'pc_owned' } }, { uid: null, state: 2, config: { serverName: 'disposed' } }] };
+  const inventory = externalInventory({ registry: { get: (plugin) => { assert.equal(plugin, mcpClient); return runtime; } } }, new Set(['pc_owned']));
+  assert.deepEqual(inventory, { servers: ['external'], available: true }); assert.ok(!JSON.stringify(inventory).includes('PRIVATE'));
+  assert.equal(REMOTE.descriptors.length, METHODS.length);
+});
